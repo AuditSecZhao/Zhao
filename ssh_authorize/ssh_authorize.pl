@@ -6,10 +6,11 @@ use DBD::mysql;
 use Getopt::Long;
 use File::Copy;
 use File::Basename;
+use Mail::Sender;
+use Encode;
+use String::MkPasswd qw(mkpasswd);
 use Crypt::CBC;
 use MIME::Base64;
-
-#ssh-keygen -t rsa -N "" -f /home/wuxiaolong/aa
 
 our($mysql_user,$mysql_passwd) = &get_local_mysql_config();
 our $is_force = 0;
@@ -23,172 +24,198 @@ my($min,$hour,$mday,$mon,$year) = (localtime $time_now_utc)[1..5];
 our $time_now_str = "$year$mon$mday$hour$min"."00";
 
 our %ssh_key_info;
-our %not_modify_key;
-
 GetOptions("g=s"=>\$group_name,"s=s"=>\$server_name,"u=s"=>\$user_name,"f"=>\$is_force);
+
+&log_process("INFO","===============Program Start==================");
 
 our $dbh=DBI->connect("DBI:mysql:database=audit_sec;host=localhost;mysql_connect_timeout=5",$mysql_user,$mysql_passwd,{RaiseError=>1});
 our $utf8 = $dbh->prepare("set names utf8");
 $utf8->execute();
 $utf8->finish();
 
-our $load_modify_sql = "
-select 
-d.id,d.device_ip,d.username,d.port,d.automodify,unix_timestamp(d.last_update_time) last_update_time,s.month,s.week,s.user_define,b.sshkeyname,b.sshprivatekey,b.sshpublickey,udf_decrypt(b.keypassword) keypassword 
-from sshkey a 
-left join sshkeyname b on a.sshkeyname=b.id 
-left join devices d on a.devicesid=d.id
-left join servers s on s.device_ip=d.device_ip
-where b.id is not null order by sshprivatekey";
-
-my $sqr_select = $dbh->prepare($load_modify_sql);
-$sqr_select->execute();
-while(my $ref_select = $sqr_select->fetchrow_hashref())
+&load_db_info();
+&handle_condition();
+if(scalar keys %ssh_key_info == 0)
 {
-    my $device_id = $ref_select->{"id"};
-    my $device_ip = $ref_select->{"device_ip"};
-    my $username = $ref_select->{"username"};
-    my $port = $ref_select->{"port"};
-    my $automodify = $ref_select->{"automodify"};
-    my $last_update_time = $ref_select->{"last_update_time"};
-    my $month = $ref_select->{"month"};
-    my $week = $ref_select->{"week"};
-    my $user_define = $ref_select->{"user_define"};
-    my $sshkeyname = $ref_select->{"sshkeyname"};
-    my $sshprivatekey = $ref_select->{"sshprivatekey"};
-    my $sshpublickey = $ref_select->{"sshpublickey"};
-    my $keypassword = $ref_select->{"keypassword"};
+    exit 0;
+}
+&init_env();
+&pub_key_process();
 
-    if($automodify == 0)
+&package();
+#&mail_process();
+
+$dbh->disconnect();
+
+sub pub_key_process
+{
+    my @success_device_id;
+    my @fail_device_id;
+
+    `cp -r /opt/freesvr/audit/sshgw-audit/keys/authorized_keys/ /opt/freesvr/audit/sshgw-audit/keys/backups/backup_$time_now_str/authorized_keys_old`;
+    foreach my $sshkeyname(keys %ssh_key_info)
     {
-        if(exists $ssh_key_info{$sshkeyname})
+        my $success_flag = 0;
+        my $sshprivatekey = $ssh_key_info{$sshkeyname}->[0];
+        my $sshpublickey = $ssh_key_info{$sshkeyname}->[1];
+
+        &log_process("INFO","copy old key pair to /opt/freesvr/audit/sshgw-audit/keys/pvt_old/ & /opt/freesvr/audit/sshgw-audit/keys/pub_old/");
+        copy($sshprivatekey, ("/opt/freesvr/audit/sshgw-audit/keys/pvt_old/". basename $sshprivatekey));
+        copy($sshpublickey, ("/opt/freesvr/audit/sshgw-audit/keys/pub_old/". basename $sshpublickey));
+        &log_process("INFO","finish copy old key pair to /opt/freesvr/audit/sshgw-audit/keys/pvt_old/ & /opt/freesvr/audit/sshgw-audit/keys/pub_old/");
+
+        &log_process("INFO","generate new pub/pvt key for $sshpublickey");
+        if(&generate_keys(basename $sshprivatekey))
         {
-            delete $ssh_key_info{$sshkeyname};
+            foreach my $ref(@{$ssh_key_info{$sshkeyname}->[2]})
+            {
+                push @fail_device_id, $ref->[0];
+            }
+            next;
         }
 
-        unless(exists $not_modify_key{$sshkeyname})
+        &log_process("INFO","copy new key pair to /opt/freesvr/audit/sshgw-audit/keys/pvt_new/ & /opt/freesvr/audit/sshgw-audit/keys/pub_new/");
+        copy(("/tmp/". basename $sshprivatekey), ("/opt/freesvr/audit/sshgw-audit/keys/pvt_new/". basename $sshprivatekey));
+        copy(("/tmp/". basename $sshprivatekey. ".pub"), ("/opt/freesvr/audit/sshgw-audit/keys/pub_new/". basename $sshpublickey));
+        if((chmod 0400, ("/opt/freesvr/audit/sshgw-audit/keys/pvt_new/". basename $sshprivatekey),("/opt/freesvr/audit/sshgw-audit/keys/pub_new/". basename $sshpublickey)) != 2)
         {
-            $not_modify_key{$sshkeyname} = 1;
+            &log_process("ERROR","change mode for new key pair error in /opt/freesvr/audit/sshgw-audit/keys/pub_new/". basename $sshpublickey);
+            foreach my $ref(@{$ssh_key_info{$sshkeyname}->[2]})
+            {
+                push @fail_device_id, $ref->[0];
+            }
+            next;
         }
-        next;
+        &log_process("INFO","finish copy new key pair to /opt/freesvr/audit/sshgw-audit/keys/pvt_new/ & /opt/freesvr/audit/sshgw-audit/keys/pub_new/");
+        unlink "/tmp/". basename $sshprivatekey;
+        unlink "/tmp/". basename $sshprivatekey. ".pub";
+
+        my $pubkey = &get_pub_key("/opt/freesvr/audit/sshgw-audit/keys/pub_new/". basename $sshpublickey);
+        foreach my $ref(@{$ssh_key_info{$sshkeyname}->[2]})
+        {
+            my $device_id = $ref->[0];
+            my $device_ip = $ref->[1];
+            my $user = $ref->[2];
+            my $port = $ref->[3];
+
+            if(system("/home/wuxiaolong/ssh_authorize/ssh_test.pl -h $device_ip -p $port -i $sshprivatekey -u $user")!=0)
+            {
+                &log_process("ERROR","cannot ssh to $device_ip by $user with pvt key $sshprivatekey\n");
+                push @fail_device_id, $device_id;
+                next;
+            }
+
+            &log_process("INFO","modify authorized_key for $user\@$device_ip");
+            unless(-e "/opt/freesvr/audit/sshgw-audit/keys/authorized_keys/${device_ip}_${user}")
+            {
+                &log_process("ERROR","authorized_keys for ${device_ip}_${user} not exists");
+                push @fail_device_id, $device_id;
+                next;
+            }
+
+            &modify_authorized_key($device_id,$pubkey,"/opt/freesvr/audit/sshgw-audit/keys/authorized_keys/${device_ip}_${user}");
+            &log_process("INFO","finish modify authorized_key for $device_ip");
+
+            &log_process("INFO","scp authorized_key to $user\@$device_ip");
+            if(&scp_to_remote($device_ip,$user,$port,$sshprivatekey,"/opt/freesvr/audit/sshgw-audit/keys/authorized_keys/${device_ip}_${user}") !=0)
+            {
+                &log_process("ERROR","scp authorized_key to $user\@$device_ip failed");
+                push @fail_device_id, $device_id;
+                next;
+            }
+            &log_process("INFO","finish scp authorized_key to $user\@$device_ip");
+
+            $success_flag = 1;
+            $ref->[4] = 1;
+            push @success_device_id, $device_id;
+        }
+
+        &log_process("INFO","copy new key pair to $sshprivatekey & $sshpublickey");
+        copy(("/opt/freesvr/audit/sshgw-audit/keys/pvt_new/". basename $sshprivatekey), $sshprivatekey);
+        copy(("/opt/freesvr/audit/sshgw-audit/keys/pub_new/". basename $sshpublickey), $sshpublickey);
+        &log_process("INFO","finish copy new key pair to $sshprivatekey & $sshpublickey");
     }
 
-    if($is_force)
+    &log_process("INFO","backup pub/pvt keys and authorized_keys");
+    `cp -r /opt/freesvr/audit/sshgw-audit/keys/authorized_keys/ /opt/freesvr/audit/sshgw-audit/keys/backups/backup_$time_now_str/authorized_keys_new`;
+    `cp -r /opt/freesvr/audit/sshgw-audit/keys/pvt_new/ /opt/freesvr/audit/sshgw-audit/keys/backups/backup_$time_now_str`;
+    `cp -r /opt/freesvr/audit/sshgw-audit/keys/pub_new/ /opt/freesvr/audit/sshgw-audit/keys/backups/backup_$time_now_str`;
+    `cp -r /opt/freesvr/audit/sshgw-audit/keys/pvt_old/ /opt/freesvr/audit/sshgw-audit/keys/backups/backup_$time_now_str`;
+    `cp -r /opt/freesvr/audit/sshgw-audit/keys/pub_old/ /opt/freesvr/audit/sshgw-audit/keys/backups/backup_$time_now_str`;
+    &log_process("INFO","all pub/pvt change finish");
+    &log_process("INFO","======success id(s): ".join(",",@success_device_id)."======");
+    &log_process("INFO","======failed id(s): ".join(",",@fail_device_id)."======");
+}
+
+sub package
+{
+    &log_process("INFO","start compress files");
+    my $cur_path = $ENV{'PWD'};
+    chdir "/opt/freesvr/audit/sshgw-audit/keys/backups/";
+
+    my $sqr_select = $dbh->prepare("select udf_decrypt(password) zip_passwd from password_crypt order by id desc limit 1");
+    $sqr_select->execute();
+    my $ref_select = $sqr_select->fetchrow_hashref();
+    my $zip_passwd = $ref_select->{"zip_passwd"};
+    $sqr_select->finish();
+
+    my $zip_cmd = "zip -qr -P $zip_passwd ./backup_$time_now_str.zip ./backup_$time_now_str";
+    print $zip_cmd,"\n";
+    system($zip_cmd);
+    `rm -fr /opt/freesvr/audit/sshgw-audit/keys/backups/backup_$time_now_str`;
+    chdir $cur_path;
+    &log_process("INFO","finish compress files");
+}
+
+sub mail_process
+{
+    &log_process("INFO","sending email...");
+    my $mail = $dbh->prepare("select mailserver,account,password from alarm");
+    $mail->execute();
+    my $ref_mail = $mail->fetchrow_hashref();
+    my $mailserver = $ref_mail->{"mailserver"};
+    my $mailfrom = $ref_mail->{"account"};
+    my $mailpwd = $ref_mail->{"password"};
+    $mail->finish();
+
+    my @mail_to;
+    my $sqr_select = $dbh->prepare("select email from member where username='password'");
+    $sqr_select->execute();
+    while(my $ref_select = $sqr_select->fetchrow_hashref())
     {
-        unless(exists $ssh_key_info{$sshkeyname})
+        my $email = $ref_select->{"email"};
+        unless(defined $email && !($email =~ /^\s+$/))
         {
-            my @tmp;
-            my @key_info = ($sshprivatekey,$sshpublickey,\@tmp);
-            $ssh_key_info{$sshkeyname} = \@key_info;
+            next;
         }
-        my @user_info = ($device_id,$device_ip,$username,$port);
-        push @{$ssh_key_info{$sshkeyname}->[2]}, \@user_info;
+        push @mail_to, $email;
     }
-    elsif(&check_modify($last_update_time,$month,$week,$user_define) && !exists $not_modify_key{$sshkeyname})
+    $sqr_select->finish();
+
+    my $subject = "密码文件备份 $time_now_str";
+    my $msg = "密码文件备份 $time_now_str";
+    my $status = &send_mail(join(",", @mail_to),$subject,$msg,"/opt/freesvr/audit/sshgw-audit/keys/backups/backup_$time_now_str.zip",$mailserver,$mailfrom,$mailpwd);
+    if($status == 1)
     {
-        unless(exists $ssh_key_info{$sshkeyname})
-        {
-            my @tmp;
-            my @key_info = ($sshprivatekey,$sshpublickey,\@tmp);
-            $ssh_key_info{$sshkeyname} = \@key_info;
-        }
-        my @user_info = ($device_id,$device_ip,$username,$port);
-        push @{$ssh_key_info{$sshkeyname}->[2]}, \@user_info;
+        &log_process("INFO","send email success");
     }
     else
     {
-        if(exists $ssh_key_info{$sshkeyname})
-        {
-            delete $ssh_key_info{$sshkeyname};
-        }
-
-        unless(exists $not_modify_key{$sshkeyname})
-        {
-            $not_modify_key{$sshkeyname} = 1;
-        }
+        &log_process("INFO","send email fail");
     }
 }
-$sqr_select->finish();
-
-&init_env();
-
-foreach my $sshkeyname(keys %ssh_key_info)
-{
-    my $sshprivatekey = $ssh_key_info{$sshkeyname}->[0];
-    my $sshpublickey = $ssh_key_info{$sshkeyname}->[1];
-    print $sshpublickey,"\n";
-
-    &log_process("copy old key pair to /opt/freesvr/audit/sshgw-audit/keys/pvt_old/ & /opt/freesvr/audit/sshgw-audit/keys/pub_old/");
-    copy($sshprivatekey, ("/opt/freesvr/audit/sshgw-audit/keys/pvt_old/". basename $sshprivatekey));
-    copy($sshpublickey, ("/opt/freesvr/audit/sshgw-audit/keys/pub_old/". basename $sshpublickey));
-    &log_process("finish copy old key pair to /opt/freesvr/audit/sshgw-audit/keys/pvt_old/ & /opt/freesvr/audit/sshgw-audit/keys/pub_old/");
-
-    if(&generate_keys(basename $sshprivatekey))
-    {
-        next;
-    }
-
-    &log_process("copy new key pair to /opt/freesvr/audit/sshgw-audit/keys/pvt_new/ & /opt/freesvr/audit/sshgw-audit/keys/pub_new/");
-    copy(("/tmp/". basename $sshprivatekey), ("/opt/freesvr/audit/sshgw-audit/keys/pvt_new/". basename $sshprivatekey));
-    copy(("/tmp/". basename $sshprivatekey. ".pub"), ("/opt/freesvr/audit/sshgw-audit/keys/pub_new/". basename $sshpublickey));
-    if((chmod 0400, ("/opt/freesvr/audit/sshgw-audit/keys/pvt_new/". basename $sshprivatekey),("/opt/freesvr/audit/sshgw-audit/keys/pub_new/". basename $sshpublickey)) != 2)
-    {
-        &log_process("change mode for new key pair error in /opt/freesvr/audit/sshgw-audit/keys/pub_new/". basename $sshpublickey);
-        next;
-    }
-    &log_process("finish copy old key pair to /opt/freesvr/audit/sshgw-audit/keys/pvt_new/ & /opt/freesvr/audit/sshgw-audit/keys/pub_new/");
-    unlink "/tmp/". basename $sshprivatekey;
-    unlink "/tmp/". basename $sshprivatekey. ".pub";
-
-    my $pubkey = &get_pub_key("/opt/freesvr/audit/sshgw-audit/keys/pub_new/". basename $sshpublickey);
-    foreach my $ref(@{$ssh_key_info{$sshkeyname}->[2]})
-    {
-        my $device_id = $ref->[0];
-        my $device_ip = $ref->[1];
-        my $user = $ref->[2];
-        my $port = $ref->[3];
-
-        if(system("/home/wuxiaolong/ssh_authorize/ssh_test.pl -h $device_ip -p $port -i $sshprivatekey -u $user")!=0)
-        {
-            &log_process("cannot ssh to $device_ip by $user with pvt key $sshprivatekey\n");
-            next;
-        }
-
-        &log_process("modify authorized_key for $device_ip");
-        unless(-e "/opt/freesvr/audit/sshgw-audit/keys/authorized_keys/${device_ip}_${user}")
-        {
-            &log_process("authorized_keys for ${device_ip}_${user} not exists");
-            next;
-        }
-
-        &modify_authorized_key($device_id,$pubkey,"/opt/freesvr/audit/sshgw-audit/keys/authorized_keys/${device_ip}_${user}");
-        &log_process("finish modify authorized_key for $device_ip");
-        &log_process("scp authorized_key to $user\@$device_ip");
-        &scp_to_remote($device_ip,$user,$port,$sshprivatekey,"/opt/freesvr/audit/sshgw-audit/keys/authorized_keys/${device_ip}_${user}");
-        &log_process("finish scp authorized_key to $user\@$device_ip");
-
-        my $sqr_update = $dbh->prepare("update devices set last_update_time='$time_now_str' where id=$device_id");
-        $sqr_update->execute();
-        $sqr_update->finish();
-    }
-
-    &log_process("copy new key pair to $sshprivatekey & $sshpublickey");
-    copy(("/opt/freesvr/audit/sshgw-audit/keys/pvt_new/". basename $sshprivatekey), $sshprivatekey);
-    copy(("/opt/freesvr/audit/sshgw-audit/keys/pub_new/". basename $sshpublickey), $sshpublickey);
-    &log_process("finish copy new key pair to $sshprivatekey & $sshpublickey");
-}
-
-$dbh->disconnect();
 
 sub scp_to_remote
 {
     my($device_ip,$user,$port,$sshprivatekey,$authorized_key) = @_;
     my $cmd = "scp -i $sshprivatekey -P $port $authorized_key $user\@$device_ip:~/.ssh/authorized_keys";
-    &log_process("scp authorized_key by $cmd");
+    &log_process("INFO","scp authorized_key by $cmd");
     if(system($cmd) != 0)
     {
-        &log_process("scp authorized_key for $device_ip, user: $user error");
+        &log_process("ERROR","scp authorized_key for $device_ip, user: $user error");
+        return 1;
     }
+    return 0;
 }
 
 sub modify_authorized_key
@@ -236,14 +263,14 @@ sub generate_keys
 
     if(system("ssh-keygen -t rsa -N \"\" -C \"\" -f /tmp/$key_file") != 0)
     {
-        &log_process("ssh-keygen error for $key_file");
-        foreach my $file(glob "$key_file"."*")
+        &log_process("ERROR","ssh-keygen error for $key_file");
+        foreach my $file(glob "/tmp/$key_file"."*")
         {
             unlink $file;
         }
         return 1;
     }
-    &log_process("generate ssh key in /tmp/$key_file");
+    &log_process("INFO","generate ssh key in /tmp/$key_file");
     return 0;
 }
 
@@ -251,22 +278,22 @@ sub init_env
 {
     unless(-e "/opt/freesvr/audit/sshgw-audit/keys/pvt_old")
     {
-        `mkdir -p /opt/freesvr/audit/sshgw-audit/keys/pvt_old`;
+        `cp -r /opt/freesvr/audit/sshgw-audit/keys/pvt /opt/freesvr/audit/sshgw-audit/keys/pvt_old`;
     }
 
     unless(-e "/opt/freesvr/audit/sshgw-audit/keys/pvt_new")
     {
-        `mkdir -p /opt/freesvr/audit/sshgw-audit/keys/pvt_new`;
+        `cp -r /opt/freesvr/audit/sshgw-audit/keys/pvt /opt/freesvr/audit/sshgw-audit/keys/pvt_new`;
     }
 
     unless(-e "/opt/freesvr/audit/sshgw-audit/keys/pub_old")
     {
-        `mkdir -p /opt/freesvr/audit/sshgw-audit/keys/pub_old`;
+        `cp -r /opt/freesvr/audit/sshgw-audit/keys/pub /opt/freesvr/audit/sshgw-audit/keys/pub_old`;
     }
 
     unless(-e "/opt/freesvr/audit/sshgw-audit/keys/pub_new")
     {
-        `mkdir -p /opt/freesvr/audit/sshgw-audit/keys/pub_new`;
+        `cp -r /opt/freesvr/audit/sshgw-audit/keys/pub /opt/freesvr/audit/sshgw-audit/keys/pub_new`;
     }
 
     unless(-e "/opt/freesvr/audit/sshgw-audit/keys/backups")
@@ -274,35 +301,217 @@ sub init_env
         `mkdir -p /opt/freesvr/audit/sshgw-audit/keys/backups`;
     }
 
+    unless(-e "/opt/freesvr/audit/sshgw-audit/keys/backups/backup_$time_now_str")
+    {
+        `mkdir -p /opt/freesvr/audit/sshgw-audit/keys/backups/backup_$time_now_str`;
+    }
+
+
     unless(-e "/opt/freesvr/audit/sshgw-audit/keys/authorized_keys")
     {
-        &log_process("authorized_keys for authorized_keys not exists");
+        &log_process("ERROR","authorized_keys for authorized_keys not exists");
         exit 1;
+    }
+}
+
+sub handle_condition
+{
+    my $load_modify_sql = undef;
+
+    if(defined $group_name)
+    {
+        &log_process("INFO","change ssh authorize for group: $group_name");
+        my $load_modify_sql = "
+            select 
+            d.id,b.sshkeyname
+            from sshkey a 
+            left join sshkeyname b on a.sshkeyname=b.id 
+            left join devices d on a.devicesid=d.id
+            left join servers s on s.device_ip=d.device_ip
+            left join servergroup sg on s.groupid=sg.id
+            where b.id is not null and sg.groupname='$group_name'";
+    }
+    elsif(defined $server_name && !defined $user_name)
+    {
+        &log_process("INFO","change ssh authorize for server: $server_name");
+        my $load_modify_sql = "
+            select 
+            d.id,b.sshkeyname
+            from sshkey a 
+            left join sshkeyname b on a.sshkeyname=b.id 
+            left join devices d on a.devicesid=d.id
+            left join servers s on s.device_ip=d.device_ip
+            where b.id is not null and s.device_ip='$server_name'";
+
+    }
+    elsif(defined $server_name && defined $user_name)
+    {
+        &log_process("INFO","change ssh authorize for $user_name\@$server_name");
+        my $load_modify_sql = "
+            select 
+            d.id,b.sshkeyname
+            from sshkey a 
+            left join sshkeyname b on a.sshkeyname=b.id 
+            left join devices d on a.devicesid=d.id
+            left join servers s on s.device_ip=d.device_ip
+            where b.id is not null and s.device_ip='$server_name' and d.username='$user_name'";
     }
 
-    &log_process("backup pvt keys to /opt/freesvr/audit/sshgw-audit/keys/backups");
-    if(system("zip -qrj '/opt/freesvr/audit/sshgw-audit/keys/backups/pvt-$time_now_str.zip' '/opt/freesvr/audit/sshgw-audit/keys/pvt'") != 0)
+    if(defined $load_modify_sql)
     {
-        &log_process("backup pvt keys error");
-        exit 1;
-    }
-    &log_process("finish backup pvt keys to /opt/freesvr/audit/sshgw-audit/keys/backups");
+        my %condition_hash;
+        my $sqr_select = $dbh->prepare($load_modify_sql);
+        $sqr_select->execute();
+        while(my $ref_select = $sqr_select->fetchrow_hashref())
+        {
+            my $device_id = $ref_select->{"id"};
+            my $sshkeyname = $ref_select->{"sshkeyname"};
+            unless(defined $sshkeyname)
+            {
+                $sshkeyname = "NULL";
+            }
 
-    &log_process("backup pub keys to /opt/freesvr/audit/sshgw-audit/keys/backups");
-    if(system("zip -qrj '/opt/freesvr/audit/sshgw-audit/keys/backups/pub-$time_now_str.zip' '/opt/freesvr/audit/sshgw-audit/keys/pub'") != 0)
-    {
-        &log_process("backup pub keys error");
-        exit 1;
-    }
-    &log_process("finish backup pub keys to /opt/freesvr/audit/sshgw-audit/keys/backups");
+            unless(exists $condition_hash{$sshkeyname})
+            {
+                my @tmp;
+                $condition_hash{$sshkeyname} = \@tmp;
+            }
+            push @{$condition_hash{$sshkeyname}}, $device_id;
+        }
+        $sqr_select->finish();
 
-    &log_process("backup authorized_keys to /opt/freesvr/audit/sshgw-audit/keys/backups");
-    if(system("zip -qrj '/opt/freesvr/audit/sshgw-audit/keys/backups/authorized_keys-$time_now_str.zip' '/opt/freesvr/audit/sshgw-audit/keys/authorized_keys'") != 0)
-    {
-        &log_process("backup authorized_keys error");
-        exit 1;
+        foreach my $key(keys %ssh_key_info)
+        {
+            unless(exists $condition_hash{$key})
+            {
+                delete $ssh_key_info{$key};
+            }
+        }
+
+        foreach my $key(keys %condition_hash)
+        {
+            my @ssh_device;
+            my @cond_device = $condition_hash{$key};
+
+            if(exists $ssh_key_info{$key})
+            {
+                foreach my $ref(@{$ssh_key_info{$key}->[2]})
+                {
+                    push @ssh_device, $ref->[0];
+                }
+            }
+            @ssh_device = sort(@ssh_device);
+            @cond_device = sort(@cond_device);
+
+            my $str1 = join(",",@ssh_device);
+            my $str2 = join(",",@cond_device);
+
+            if($str1 ne $str2)
+            {
+                &log_process("ERROR","condition devices conflict with ssh device in ssh key: $key, condition device $str2, ssh device $str1");
+                exit 1;
+            }
+        }
     }
-    &log_process("finish backup authorized_keys to /opt/freesvr/audit/sshgw-audit/keys/backups");
+
+    my @result;
+    foreach my $sshkeyname(keys %ssh_key_info)
+    {
+        foreach my $ref(@{$ssh_key_info{$sshkeyname}->[2]})
+        {
+            push @result, $ref->[0];
+        }
+    }
+
+    &log_process("INFO","====== Process Device List ======");
+    &log_process("INFO","Device id: ".join(",",@result));
+}
+
+sub load_db_info
+{
+    my %not_modify_key;
+    my $load_modify_sql = "
+        select 
+        d.id,d.device_ip,d.username,d.port,d.automodify,unix_timestamp(d.last_update_time) last_update_time,s.month,s.week,s.user_define,b.sshkeyname,b.sshprivatekey,b.sshpublickey,udf_decrypt(b.keypassword) keypassword 
+        from sshkey a 
+        left join sshkeyname b on a.sshkeyname=b.id 
+        left join devices d on a.devicesid=d.id
+        left join servers s on s.device_ip=d.device_ip
+        where b.id is not null order by sshprivatekey";
+
+    my $sqr_select = $dbh->prepare($load_modify_sql);
+    $sqr_select->execute();
+    while(my $ref_select = $sqr_select->fetchrow_hashref())
+    {
+        my $device_id = $ref_select->{"id"};
+        my $device_ip = $ref_select->{"device_ip"};
+        my $username = $ref_select->{"username"};
+        my $port = $ref_select->{"port"};
+        my $automodify = $ref_select->{"automodify"};
+        my $last_update_time = $ref_select->{"last_update_time"};
+        my $month = $ref_select->{"month"};
+        my $week = $ref_select->{"week"};
+        my $user_define = $ref_select->{"user_define"};
+        my $sshkeyname = $ref_select->{"sshkeyname"};
+        my $sshprivatekey = $ref_select->{"sshprivatekey"};
+        my $sshpublickey = $ref_select->{"sshpublickey"};
+        my $keypassword = $ref_select->{"keypassword"};
+
+        if($automodify == 0)
+        {
+            if(exists $ssh_key_info{$sshkeyname})
+            {
+                delete $ssh_key_info{$sshkeyname};
+            }
+
+            unless(exists $not_modify_key{$sshkeyname})
+            {
+                $not_modify_key{$sshkeyname} = 1;
+            }
+            next;
+        }
+
+        if(exists $not_modify_key{$sshkeyname})
+        {
+            next;
+        }
+
+        if($is_force)
+        {
+            unless(exists $ssh_key_info{$sshkeyname})
+            {
+                my @tmp;
+                my @key_info = ($sshprivatekey,$sshpublickey,\@tmp);
+                $ssh_key_info{$sshkeyname} = \@key_info;
+            }
+            my @user_info = ($device_id,$device_ip,$username,$port);
+            push @{$ssh_key_info{$sshkeyname}->[2]}, \@user_info;
+        }
+        elsif(&check_modify($last_update_time,$month,$week,$user_define))
+        {
+            unless(exists $ssh_key_info{$sshkeyname})
+            {
+                my @tmp;
+                my @key_info = ($sshprivatekey,$sshpublickey,\@tmp);
+                $ssh_key_info{$sshkeyname} = \@key_info;
+            }
+            my @user_info = ($device_id,$device_ip,$username,$port,0,0);
+            push @{$ssh_key_info{$sshkeyname}->[2]}, \@user_info;
+        }
+        else
+        {
+            if(exists $ssh_key_info{$sshkeyname})
+            {
+                delete $ssh_key_info{$sshkeyname};
+            }
+
+            unless(exists $not_modify_key{$sshkeyname})
+            {
+                $not_modify_key{$sshkeyname} = 1;
+            }
+        }
+    }
+    $sqr_select->finish();
 }
 
 sub check_modify
@@ -329,8 +538,41 @@ sub check_modify
 
 sub log_process
 {
-    my($log) = @_;
-    print $log,"\n";
+    my($level, $log) = @_;
+    my $log_utc = time;
+    my($sec,$min,$hour,$mday,$mon,$year) = (localtime $log_utc)[0..5];
+    ($sec,$min,$hour,$mday,$mon,$year) = (sprintf("%02d", $sec),sprintf("%02d", $min),sprintf("%02d", $hour),sprintf("%02d", $mday),sprintf("%02d", $mon + 1),$year+1900);
+    my $log_time_str = "$year-$mon-$mday $hour:$min:$sec";
+
+    print "[$level $log_time_str]: $log\n";
+}
+
+sub send_mail
+{   
+    my($mailto,$subject,$msg,$file_path,$mailserver,$mailfrom,$mailpwd) = @_;
+
+    my $sender = new Mail::Sender;
+    $subject =  encode("gb2312", decode("utf8", $subject));
+    $msg =  encode("gb2312", decode("utf8", $msg));
+
+    if ($sender->MailFile({
+            smtp => $mailserver,
+            from => $mailfrom,
+            to => $mailto,
+            subject => $subject,
+            msg => $msg,
+            auth => 'LOGIN',
+            authid => $mailfrom,
+            authpwd => $mailpwd,
+            file => $file_path,
+            b_charset => 'gb2312',
+            })<0){
+        return 2;
+    }
+    else
+    {
+        return 1;
+    }
 }
 
 sub get_local_mysql_config
