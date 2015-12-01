@@ -136,7 +136,7 @@ elsif($action eq "passwdchange")
         $passwd = "";
     }
 
-    my $cmd = "echo $passwd | passwd $user --stdin;echo \"get status: \$?\"";
+    my $cmd = "echo '$passwd' | passwd $user --stdin;echo \"get status: \$?\"";
     my($status,$ref_line) = &get_output($exp,$cmd,"status");
     if($status != 0)
     {

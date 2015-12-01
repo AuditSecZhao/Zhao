@@ -11,8 +11,12 @@ use Encode;
 use String::MkPasswd qw(mkpasswd);
 use Crypt::CBC;
 use MIME::Base64;
+use Digest::MD5 qw(md5_base64);
 
-=pod
+my $hash = md5_base64 "freesvr123";
+print $hash,"\n";
+exit;
+
 my $maxrepeat = 4;
 my $mindiff = 4;
 my $old_passwd = "7Bwkb[gd";
@@ -105,39 +109,4 @@ sub check_passwd
     }
 
     return 0;
-}
-=cut
-
-&send_mail("wxl890206\@126.com","1。2.3.5 i asga 密码信息", "1。2.3.5 i asga 密码信息","smtp.163.com", "testnetmwd\@163.com", "netmwd123");
-#&send_mail("965792145\@qq.com","1.2.3.4 密码信息", "1。2.3.5 i asga 密码信息","smtp.163.com", "testnetmwd\@163.com", "netmwd123");
-
-sub send_mail
-{   
-    my($mailto,$subject,$msg,$mailserver,$mailfrom,$mailpwd) = @_;
-    
-    my $sender = new Mail::Sender;
-#   $subject = encode_mimewords($subject,'Charset','UTF-8');
-    $subject =  encode("gb2312", decode("utf8", $subject));           #freesvr 专用
-#   $msg = encode_mimewords($msg,'Charset','gb2312');
-        $msg =  encode("gb2312", decode("utf8", $msg));              #freesvr 专用
-        
-        if ($sender->MailFile({
-                    smtp => $mailserver,
-                    from => $mailfrom,
-                    to => $mailto,
-                    subject => $subject,
-                    msg => $msg,
-                    auth => 'LOGIN',
-                    authid => $mailfrom,
-                    authpwd => $mailpwd,
-                    file => '../a.tgz',
-                    b_charset => 'gb2312',
-#               encoding => 'gb2312',
-                    })<0){
-            return 2;
-        }
-        else
-        {
-            return 1;
-        }
 }
