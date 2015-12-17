@@ -107,8 +107,6 @@ sub pro_process
             exit 1;
         }
 
-#        $file_end_time = time;
-#        $file_start_time = $file_end_time - $interval * 3600 * 24;
         $file_end_time = time - $interval * 3600 * 24;
         $file_start_time = 0;
 
