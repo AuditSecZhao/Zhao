@@ -47,7 +47,7 @@ else
 {               
     print "scp fail\n"; 
     print $fd_fw "$time_now_str\tscp fail\n";
-    exit 1;
+#    exit 1;
 }
 &append_func();
 unlink "/tmp/RE_applog";
