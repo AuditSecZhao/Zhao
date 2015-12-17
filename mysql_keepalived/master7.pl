@@ -53,7 +53,7 @@ unlink "/tmp/keepalived.conf.bak";
 &file_modify_process("/opt/freesvr/audit/sshgw-audit/etc/freesvr-ssh-proxy_config","AuditAddress",$local_ip);
 &file_modify_process("/opt/freesvr/audit/etc/global.cfg","global-server",$local_ip);
 &file_modify_process("/opt/freesvr/audit/ftp-audit/etc/freesvr-ftp-audit.conf","AuditAddress",$local_ip);
-&file_modify_process("/home/wuxiaolong/5_backup/backup_session.pl","our\\s+\\\$localIp",$local_ip);
+#&file_modify_process("/home/wuxiaolong/5_backup/backup_session.pl","our\\s+\\\$localIp",$local_ip);
 &cron_modify_process("/home/wuxiaolong/5_backup/backup_session.pl");
 
 sub iptables_process
@@ -170,6 +170,10 @@ sub sql_process
 		$sqr_insert->finish();
 	}
 	$sqr_select->finish();
+
+    my $sqr_update = $local_dbh->prepar("replace into backup_session_device(device_ip) values ('$peer_ip')");
+    $sqr_update->execute();
+    $sqr_update->finish();
 
     $remote_dbh->disconnect();
     $local_dbh->disconnect();

@@ -16,7 +16,8 @@ use MIME::Base64;
 # 1 rsync连接出错
 # 2 指定文件不存在
 
-our $localIp = '118.186.17.118';
+our $ip_white_list = "";
+
 our $time_now_utc = time;
 my($min,$hour,$mday,$mon,$year) = (localtime $time_now_utc)[1..5];
 ($min,$hour,$mday,$mon,$year) = (sprintf("%02d", $min),sprintf("%02d", $hour),sprintf("%02d", $mday),sprintf("%02d", $mon + 1),$year+1900);
@@ -32,6 +33,8 @@ my $utf8 = $dbh->prepare("set names utf8");
 $utf8->execute();
 $utf8->finish();
 
+&get_white_list();
+
 &backup_session($dbh,"sessions","sid","server_addr","logfile","replayfile");
 &backup_session($dbh,"rdpsessions","sid","proxy_addr","replayfile","keydir");
 &backup_ftp($dbh,"ftpcomm","ftpsessions","sid","auditaddr","filename");
@@ -41,11 +44,30 @@ $dbh->disconnect();
 close $fd_lock;
 unlink $lock_file;
 
+sub get_white_list
+{
+    my @ip_list;
+    my $sqr_select = $dbh->prepare("select device_ip from backup_session_device");
+    $sqr_select->execute();
+    while(my $ref = $sqr_select->fetchrow_hashref())
+	{
+		my $device_ip = $ref->{"device_ip"};
+        push @ip_list, "'".$device_ip."'";
+	}
+	$sqr_select->finish();
+
+    $ip_white_list = "(". join(", ",@ip_list) .")";
+}
+
 sub backup_ftp
 {
     my($dbh,$table_file,$table_id,$id,$addr,$file) = @_;
 
-    my $sqr_select = $dbh->prepare("select $table_file.$id,$file,$addr from $table_file left join $table_id on $table_file.$id=$table_id.$id where $addr is not null and $addr!='$localIp' and $addr!='127.0.0.1' and backup=0");
+    my $sqr_update = $dbh->prepare("update $table_file left join $table_id on $table_file.$id=$table_id.$id set backup = 1 where $addr not in $ip_white_list or $addr='127.0.0.1'");
+    $sqr_update->execute();
+    $sqr_update->finish();
+
+    my $sqr_select = $dbh->prepare("select $table_file.$id,$file,$addr from $table_file left join $table_id on $table_file.$id=$table_id.$id where $addr in $ip_white_list and $addr!='127.0.0.1' and backup=0");
     $sqr_select->execute();
     while(my $ref = $sqr_select->fetchrow_hashref())
 	{
@@ -89,7 +111,11 @@ sub backup_session
 {
 	my($dbh,$table,$id,$addr,$file1,$file2) = @_;
 
-	my $sqr_select = $dbh->prepare("select $id,$file1,$file2,$addr from $table where $addr is not null and $addr!='$localIp' and $addr!='127.0.0.1' and backup=0");
+    my $sqr_update = $dbh->prepare("update $table set backup = 1 where $addr not in $ip_white_list or $addr='127.0.0.1'");
+    $sqr_update->execute();
+    $sqr_update->finish();
+
+	my $sqr_select = $dbh->prepare("select $id,$file1,$file2,$addr from $table where $addr in $ip_white_list and $addr!='127.0.0.1' and backup=0");
 	$sqr_select->execute();
 	while(my $ref = $sqr_select->fetchrow_hashref())
 	{
@@ -157,11 +183,14 @@ sub backup_session
 
 sub transport
 {
-	my($ip,$path) = @_;
+	my($ip,$file) = @_;
 
-	my $file = basename $path;
-	$path = dirname $path;
-	my $cmd = "lftp -c 'mirror -n --include=$file sftp://root\@$ip:2288$path $path'; echo \"lftp status:\$?\"";
+	my $dir = dirname $file;
+    unless(-e $dir)
+    {
+        `mkdir -p $dir`;
+    }
+	my $cmd = "lftp -c 'get sftp://root\@$ip:2288$file -o $dir'; echo \"lftp status:\$?\"";
 #	print $cmd,"\n";
 	my $flag = 1;
 	foreach my $line(split /\n/,`$cmd`)
